@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Объезд — веб-прототип</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+<style>
+:root{font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17243c;background:#f4f6f9}*{box-sizing:border-box}body{margin:0}.app{display:grid;grid-template-columns:330px 1fr;height:100vh}.panel{background:#fff;padding:18px;overflow:auto;border-right:1px solid #dfe5ef;z-index:2}.brand{font-size:24px;font-weight:800;margin:0 0 4px}.sub{color:#65748b;font-size:13px;margin:0 0 18px}.group{margin:14px 0}.modes{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px}.modes button,.btn{border:1px solid #ccd5e3;background:#fff;border-radius:10px;padding:10px 12px;font:inherit;cursor:pointer}.modes button[aria-pressed="true"]{background:#245eff;color:#fff;border-color:#245eff}.row{display:flex;gap:8px;align-items:center;justify-content:space-between;margin:10px 0}.row label{font-size:14px}.row select{min-width:130px;border:1px solid #ccd5e3;border-radius:8px;padding:8px;background:#fff}.btn{width:100%;margin-top:8px}.btn.primary{background:#245eff;color:#fff;border-color:#245eff;font-weight:700}.btn:disabled{opacity:.55;cursor:not-allowed}.status{margin-top:14px;padding:12px;border-radius:10px;background:#f1f5ff;font-size:13px;line-height:1.45}.result{font-size:24px;font-weight:800;margin-bottom:5px}.meta{font-size:12px;color:#66758a;white-space:pre-line}.posts{margin-top:14px;font-size:13px;color:#66758a}.map-wrap{position:relative;min-width:0}.map{height:100%;width:100%;background:#e9edf3}.notice{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:500;background:#fff;padding:8px 12px;border-radius:9px;box-shadow:0 2px 16px #0002;font-size:12px;max-width:70%;display:none}.leaflet-container{font:inherit}@media(max-width:760px){.app{grid-template-columns:1fr;grid-template-rows:auto 1fr}.panel{border-right:0;border-bottom:1px solid #dfe5ef;max-height:46vh}.map-wrap{min-height:54vh}.brand{font-size:20px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="panel">
+    <h1 class="brand">Объезд</h1>
+    <p class="sub">Прототип маршрутизации вокруг пользовательских учебных зон.</p>
+
+    <div class="group modes">
+      <button data-mode="a" aria-pressed="false">Точка А</button>
+      <button data-mode="b" aria-pressed="false">Точка Б</button>
+      <button data-mode="post" aria-pressed="true">Зона +</button>
+    </div>
+
+    <div id="points" class="meta"></div>
+
+    <div class="row"><label for="radius">Радиус зоны</label><select id="radius"><option value="15">15 м</option><option value="25" selected>25 м</option><option value="40">40 м</option><option value="60">60 м</option></select></div>
+    <div class="row"><label for="algorithm">Алгоритм</label><select id="algorithm"><option value="bidirectional" selected>Двунаправленная Дейкстра</option><option value="dijkstra">Дейкстра</option></select></div>
+    <div class="row"><label for="avoid">Объезжать зоны</label><input id="avoid" type="checkbox" checked></div>
+
+    <button id="build" class="btn primary">Построить маршрут</button>
+    <button id="clear" class="btn">Очистить зоны</button>
+
+    <div class="status">
+      <div id="result" class="result"></div>
+      <div id="status">Поставь точки А и Б, при необходимости добавь зоны, затем построй маршрут.</div>
+      <div id="details" class="meta"></div>
+    </div>
+    <div id="posts" class="posts"></div>
+    <p class="meta" style="margin-top:16px">Дороги: © OpenStreetMap contributors. Данные загружаются через публичные Overpass API и сохраняются локально в браузере.</p>
+  </aside>
+  <main class="map-wrap">
+    <div id="notice" class="notice"></div>
+    <div id="map" class="map"></div>
+  </main>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin="" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js'"></script>
+<script>
+(() => {
+'use strict';
+const $=id=>document.getElementById(id);
+const status=t=>{$('status').textContent=t};
+if(!window.L){status('Не удалось загрузить библиотеку карты. Обнови страницу при доступном интернете.');return;}
+
+const map=L.map('map',{minZoom:3,maxZoom:19}).setView([55.759,37.617],12);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap contributors'}).addTo(map);
+L.control.scale({imperial:false}).addTo(map);
+const pins=L.layerGroup().addTo(map),routes=L.layerGroup().addTo(map);
+let A=[55.750,37.570],B=[55.770,37.640],posts=[],mode='post',busy=false,currentController=null;
+const cache=[];
+const HIGHWAYS='motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|service';
+const ENDPOINTS=[
+  ['Private.coffee','https://overpass.private.coffee/api/interpreter'],
+  ['VK Maps','https://maps.mail.ru/osm/tools/overpass/api/interpreter'],
+  ['OSM main','https://overpass-api.de/api/interpreter']
+];
+
+function setMode(v){mode=v;document.querySelectorAll('[data-mode]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.mode===v)));}
+function paint(){
+  pins.clearLayers();
+  [[A,'A','#245eff'],[B,'B','#17243c']].forEach(([p,t,c])=>L.circleMarker(p,{radius:10,color:'#fff',weight:3,fillColor:c,fillOpacity:1}).bindTooltip(t,{permanent:true,direction:'top'}).addTo(pins));
+  posts.forEach((p,i)=>L.circle(p,{radius:+$('radius').value,color:'#e2573e',weight:2,fillColor:'#e2573e',fillOpacity:.15}).bindTooltip('Зона '+(i+1)).addTo(pins));
+  $('points').textContent=`A: ${A[0].toFixed(5)}, ${A[1].toFixed(5)}\nB: ${B[0].toFixed(5)}, ${B[1].toFixed(5)}`;
+  $('posts').textContent=posts.length?`Зон: ${posts.length}. Нажми по зоне правой кнопкой, чтобы удалить ближайшую.`:'Зон пока нет.';
+}
+function changed(){routes.clearLayers();$('result').textContent='';$('details').textContent='';paint();status('Точки изменены. Нажми «Построить маршрут».');}
+function radius(){return +$('radius').value;}
+function metres(a,b){const r=6371000,p1=a[0]*Math.PI/180,p2=b[0]*Math.PI/180,dp=(b[0]-a[0])*Math.PI/180,dl=(b[1]-a[1])*Math.PI/180;const h=Math.sin(dp/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;return 2*r*Math.asin(Math.min(1,Math.sqrt(h)));}
+function boxFor(a,b,km){const d=km*1000/111320,mid=(a[0]+b[0])*Math.PI/360,dl=d/Math.max(.15,Math.cos(mid));return [Math.min(a[0],b[0])-d,Math.min(a[1],b[1])-dl,Math.max(a[0],b[0])+d,Math.max(a[1],b[1])+dl];}
+function covers(o,i){return o[0]<=i[0]&&o[1]<=i[1]&&o[2]>=i[2]&&o[3]>=i[3];}
+function byteSize(obj){return new Blob([JSON.stringify(obj)]).size;}
+
+function openDB(){return new Promise(resolve=>{if(!indexedDB){resolve(null);return}const r=indexedDB.open('obezd-cache-v2',1);r.onupgradeneeded=()=>r.result.createObjectStore('areas',{keyPath:'id'});r.onsuccess=()=>resolve(r.result);r.onerror=()=>resolve(null);});}
+async function loadCache(){const db=await openDB();if(!db)return;await new Promise(resolve=>{const r=db.transaction('areas').objectStore('areas').getAll();r.onsuccess=()=>{for(const e of r.result.sort((a,b)=>b.savedAt-a.savedAt).slice(0,3))cache.push(e);resolve()};r.onerror=()=>resolve()});db.close();}
+async function saveCache(entry){const db=await openDB();if(!db)return;await new Promise(resolve=>{const tx=db.transaction('areas','readwrite');tx.objectStore('areas').put(entry);tx.oncomplete=resolve;tx.onerror=resolve});db.close();cache.unshift(entry);while(cache.length>3)cache.pop();}
+
+async function fetchRoads(box){
+  const existing=cache.find(e=>covers(e.box,box));if(existing){status('Использую сохранённые дороги…');return existing.data;}
+  const query=`[out:json][timeout:25][maxsize:67108864];way["highway"~"^(${HIGHWAYS})$"](${box.join(',')});out body;>;out skel qt;`;
+  const errors=[];
+  for(const [name,url] of ENDPOINTS){
+    status(`Загружаю дороги · ${name}…`);
+    const ctrl=new AbortController();currentController=ctrl;const timer=setTimeout(()=>ctrl.abort(),30000);
+    try{
+      const response=await fetch(url+'?'+new URLSearchParams({data:query}),{signal:ctrl.signal,credentials:'omit'});
+      if(!response.ok)throw Error('HTTP '+response.status);
+      const data=await response.json();if(!data||!Array.isArray(data.elements)||!data.elements.length)throw Error('пустой ответ');
+      if(byteSize(data)>24*1024*1024)throw Error('слишком большая область');
+      const entry={id:box.map(x=>x.toFixed(5)).join(','),box,data,savedAt:Date.now()};saveCache(entry).catch(()=>{});return data;
+    }catch(e){errors.push(name+': '+(e.name==='AbortError'?'таймаут':e.message));}
+    finally{clearTimeout(timer);currentController=null;}
+  }
+  throw Error('Сервисы дорог не ответили. '+errors.join(' · '));
+}
+
+function buildGraph(data){
+  const nodes=new Map(),ways=[];
+  for(const e of data.elements){if(e.type==='node')nodes.set(e.id,[e.lat,e.lon]);else if(e.type==='way'&&e.tags?.highway)ways.push(e);}
+  const adj=new Map(),rev=new Map();
+  const add=(u,v,w)=>{if(!adj.has(u))adj.set(u,[]);if(!rev.has(v))rev.set(v,[]);const edge={from:u,to:v,w};adj.get(u).push(edge);rev.get(v).push(edge);};
+  for(const w of ways){
+    const t=w.tags||{};if(['no','private'].includes(t.access)||['no','private'].includes(t.motor_vehicle))continue;
+    let dir=0;if(t.oneway==='-1')dir=-1;else if(['yes','1','true'].includes(t.oneway)||t.junction==='roundabout')dir=1;
+    const ids=w.nodes||[];
+    for(let i=1;i<ids.length;i++){const u=ids[i-1],v=ids[i],a=nodes.get(u),b=nodes.get(v);if(!a||!b)continue;const d=metres(a,b);if(dir>=0)add(u,v,d);if(dir<=0)add(v,u,d);}
+  }
+  return {nodes,adj,rev};
+}
+function nearest(g,p){let best=null,bd=Infinity;for(const [id,q] of g.nodes){const d=metres(p,q);if(d<bd){bd=d;best=id}}return {id:best,d:bd};}
+function pointSegMetres(p,a,b){const lat=(p[0]+a[0]+b[0])/3*Math.PI/180,kx=111320*Math.cos(lat),ky=111320;const px=p[1]*kx,py=p[0]*ky,ax=a[1]*kx,ay=a[0]*ky,bx=b[1]*kx,by=b[0]*ky;const vx=bx-ax,vy=by-ay,wx=px-ax,wy=py-ay,c=vx*vx+vy*vy;const t=c?Math.max(0,Math.min(1,(wx*vx+wy*vy)/c)):0;return Math.hypot(px-(ax+t*vx),py-(ay+t*vy));}
+function blocked(g,e){if(!$('avoid').checked||!posts.length)return false;const a=g.nodes.get(e.from),b=g.nodes.get(e.to),r=radius()+10;return posts.some(p=>pointSegMetres(p,a,b)<=r);}
+
+class Heap{constructor(){this.a=[]}push(item){let i=this.a.push(item)-1;while(i){let p=(i-1)>>1;if(this.a[p][0]<=item[0])break;this.a[i]=this.a[p];i=p;this.a[i]=item}}pop(){if(!this.a.length)return null;const root=this.a[0],last=this.a.pop();if(this.a.length){let i=0;while(true){let l=i*2+1,r=l+1;if(l>=this.a.length)break;let c=r<this.a.length&&this.a[r][0]<this.a[l][0]?r:l;if(this.a[c][0]>=last[0])break;this.a[i]=this.a[c];i=c}this.a[i]=last}return root}peek(){return this.a.length?this.a[0][0]:Infinity}get size(){return this.a.length}}
+function reconstruct(prev,s,t){const path=[];let x=t;if(x==null)return null;while(x!==undefined){path.push(x);if(x===s)break;x=prev.get(x)}if(path[path.length-1]!==s)return null;return path.reverse();}
+function dijkstra(g,s,t){const dist=new Map([[s,0]]),prev=new Map(),h=new Heap();h.push([0,s]);let visited=0;while(h.size){const [d,u]=h.pop();if(d!==dist.get(u))continue;visited++;if(u===t)break;for(const e of g.adj.get(u)||[]){if(blocked(g,e))continue;const nd=d+e.w;if(nd<(dist.get(e.to)??Infinity)){dist.set(e.to,nd);prev.set(e.to,u);h.push([nd,e.to])}}}const ids=reconstruct(prev,s,t);return ids?{ids,distance:dist.get(t),visited}:null;}
+function bidijkstra(g,s,t){
+  if(s===t)return {ids:[s],distance:0,visited:1};
+  const df=new Map([[s,0]]),db=new Map([[t,0]]),pf=new Map(),pb=new Map(),hf=new Heap(),hb=new Heap();hf.push([0,s]);hb.push([0,t]);let best=Infinity,meet=null,visited=0;
+  const touch=(u)=>{const a=df.get(u),b=db.get(u);if(a!==undefined&&b!==undefined&&a+b<best){best=a+b;meet=u}};
+  while(hf.size&&hb.size){if(hf.peek()+hb.peek()>=best)break;
+    if(hf.peek()<=hb.peek()){
+      const [d,u]=hf.pop();if(d!==df.get(u))continue;visited++;touch(u);
+      for(const e of g.adj.get(u)||[]){if(blocked(g,e))continue;const nd=d+e.w;if(nd<(df.get(e.to)??Infinity)){df.set(e.to,nd);pf.set(e.to,u);hf.push([nd,e.to]);touch(e.to)}}
+    }else{
+      const [d,u]=hb.pop();if(d!==db.get(u))continue;visited++;touch(u);
+      for(const e of g.rev.get(u)||[]){if(blocked(g,e))continue;const v=e.from,nd=d+e.w;if(nd<(db.get(v)??Infinity)){db.set(v,nd);pb.set(v,u);hb.push([nd,v]);touch(v)}}
+    }
+  }
+  if(meet===null)return null;const left=reconstruct(pf,s,meet);if(!left)return null;const right=[];let x=meet;while(x!==t){x=pb.get(x);if(x===undefined)return null;right.push(x)}return {ids:left.concat(right),distance:best,visited};
+}
+function route(g,s,t){return $('algorithm').value==='bidirectional'?bidijkstra(g,s,t):dijkstra(g,s,t);}
+function routeCoords(g,r){return r.ids.map(id=>g.nodes.get(id));}
+
+async function build(){
+  if(busy)return;busy=true;$('build').disabled=true;$('build').textContent='Ищу маршрут…';routes.clearLayers();$('result').textContent='';$('details').textContent='';
+  try{
+    if(metres(A,B)>50000)throw Error('Для прототипа выбери точки не дальше 50 км друг от друга.');
+    const margins=[0.35,0.8,1.5,3,6,12];let last='';
+    for(let i=0;i<margins.length;i++){
+      const km=margins[i],box=boxFor(A,B,km);status(`Попытка ${i+1}/${margins.length}: область +${km} км…`);
+      let data;try{data=await fetchRoads(box)}catch(e){last=e.message;if(i<margins.length-1)continue;throw e}
+      status('Строю дорожный граф…');await new Promise(r=>setTimeout(r,0));const g=buildGraph(data);if(!g.nodes.size){last='В области нет подходящих дорог';continue}
+      const sa=nearest(g,A),sb=nearest(g,B);if(sa.d>1500||sb.d>1500){last='Точки слишком далеко от загруженных дорог';continue}
+      const baseAvoid=$('avoid').checked;$('avoid').checked=false;const base=route(g,sa.id,sb.id);$('avoid').checked=baseAvoid;
+      const r=route(g,sa.id,sb.id);
+      if(r){const coords=routeCoords(g,r);if(base){L.polyline(routeCoords(g,base),{color:'#8b96a8',weight:5,dashArray:'8 7',opacity:.6}).addTo(routes)}L.polyline(coords,{color:'#245eff',weight:6,opacity:.95}).addTo(routes);map.fitBounds(L.latLngBounds(coords).pad(.15),{maxZoom:16});$('result').textContent=(r.distance/1000).toFixed(2)+' км';$('details').textContent=(`${$('algorithm').value==='bidirectional'?'Двунаправленная Дейкстра':'Дейкстра'} · обработано состояний: ${r.visited.toLocaleString('ru-RU')}\nПривязка A/B к дороге: ${Math.round(sa.d)} м / ${Math.round(sb.d)} м\nОбласть поиска: +${km} км`);status(posts.length&&$('avoid').checked?'Маршрут найден без пересечения отмеченных зон.':'Маршрут найден.');return}
+      last='В этой области пути без пересечения зон нет. Расширяю поиск…';status(last);await new Promise(r=>setTimeout(r,50));
+    }
+    throw Error(last||'Путь не найден после максимального расширения области.');
+  }catch(e){status(e.message||String(e));}
+  finally{busy=false;$('build').disabled=false;$('build').textContent='Построить маршрут';currentController=null;}
+}
+
+document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
+map.on('click',e=>{const p=[e.latlng.lat,e.latlng.wrap().lng];if(mode==='a')A=p;else if(mode==='b')B=p;else if(posts.length<12)posts.push(p);changed();});
+map.on('contextmenu',e=>{if(!posts.length)return;let bi=0,bd=Infinity;posts.forEach((p,i)=>{const d=metres(p,[e.latlng.lat,e.latlng.lng]);if(d<bd){bd=d;bi=i}});if(bd<500){posts.splice(bi,1);changed();}});
+$('radius').onchange=changed;$('algorithm').onchange=changed;$('avoid').onchange=changed;$('clear').onclick=()=>{posts=[];changed()};$('build').onclick=build;
+window.addEventListener('beforeunload',()=>currentController?.abort());
+paint();loadCache().catch(()=>{});
+})();
+</script>
+</body>
+</html>
